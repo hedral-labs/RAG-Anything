@@ -58,6 +58,7 @@ class IndexManifest:
     index_backend: str
     parser: str
     manifest_sha256: str
+    indexing_profile: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -165,8 +166,35 @@ def _manifest(index_path: Path, *, expected_index_name: str | None = None) -> In
         "indexing_mode",
         "created_at",
     }
-    if not isinstance(raw, Mapping) or set(raw) != expected:
+    if not isinstance(raw, Mapping) or set(raw) not in (expected, expected | {"indexing_profile"}):
         raise RunnerInputError("index_manifest_invalid")
+    profile = raw.get("indexing_profile")
+    if "indexing_profile" in raw and profile is None:
+        raise RunnerInputError("index_manifest_invalid")
+    if profile is not None:
+        if (
+            not isinstance(profile, Mapping)
+            or set(profile) != {
+                "page_boundary_policy", "chunk_token_size", "chunk_overlap_token_size",
+                "parse_method", "formula", "table", "rankable_page_indices",
+            }
+            or profile.get("page_boundary_policy") != "strict-page-text-v1"
+            or profile.get("chunk_token_size") != 512
+            or profile.get("chunk_overlap_token_size") != 64
+            or profile.get("parse_method") != "txt"
+            or profile.get("formula") is not False
+            or profile.get("table") is not False
+        ):
+            raise RunnerInputError("index_manifest_invalid")
+        pages = profile.get("rankable_page_indices")
+        count = raw.get("page_count")
+        if (
+            not isinstance(count, int) or isinstance(count, bool)
+            or not isinstance(pages, list) or not pages
+            or any(not isinstance(page, int) or isinstance(page, bool) or page < 0 or page >= count for page in pages)
+            or pages != sorted(set(pages))
+        ):
+            raise RunnerInputError("index_manifest_invalid")
     manifest = IndexManifest(
         index_name=_safe_name(raw.get("index_name"), "index_manifest_invalid"),
         document_id=_nonblank(raw.get("document_id"), "index_manifest_invalid"),
@@ -178,6 +206,7 @@ def _manifest(index_path: Path, *, expected_index_name: str | None = None) -> In
         index_backend=_nonblank(raw.get("index_backend"), "index_manifest_invalid"),
         parser=_nonblank(raw.get("parser"), "index_manifest_invalid"),
         manifest_sha256=_file_sha256(manifest_path),
+        indexing_profile=profile,
     )
     if (
         raw.get("schema_version") != INDEX_SCHEMA
@@ -236,6 +265,15 @@ def _validate_index(index_path: Path, *, expected_index_name: str | None = None)
     chunks = _text_chunks(index_path, manifest)
     if summary.get("text_chunk_count") != len(chunks):
         raise RunnerInputError("index_data_invalid")
+    if manifest.indexing_profile is not None:
+        pages = set()
+        for chunk in chunks.values():
+            page = chunk["page_idx"]
+            if chunk.get("page_idx_end") != page:
+                raise RunnerInputError("index_data_invalid")
+            pages.add(page)
+        if sorted(pages) != manifest.indexing_profile["rankable_page_indices"]:
+            raise RunnerInputError("index_data_invalid")
     return manifest, chunks
 
 
@@ -321,6 +359,57 @@ async def _open_rag(*, storage: Path, parser_output: Path, embedding_model: Path
     return rag, dimension
 
 
+def _page_texts(content_list: object, *, page_count: int) -> dict[int, str]:
+    """Use only parsed text explicitly bound to a zero-based physical page."""
+    if not isinstance(content_list, list):
+        raise RunnerInputError("parsed_page_provenance_invalid")
+    pages: dict[int, list[str]] = {}
+    for item in content_list:
+        if not isinstance(item, Mapping):
+            raise RunnerInputError("parsed_page_provenance_invalid")
+        if item.get("type", "text") != "text":
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        page = _page_index(item.get("page_idx"), page_count=page_count, code="parsed_page_provenance_invalid")
+        pages.setdefault(page, []).append(text)
+    if not pages:
+        raise RunnerInputError("parsed_page_provenance_invalid")
+    return {page: "\n\n".join(parts) for page, parts in sorted(pages.items())}
+
+
+async def _insert_page_bounded(rag: Any, *, source: Path, document_id: str, pages: Mapping[int, str]) -> None:
+    """Make each parsed page a LightRAG document, so token windows cannot cross pages."""
+    from lightrag.base import DocStatus
+
+    page_numbers = list(pages)
+    doc_ids = [f"{document_id}-physical-page-{page:05d}" for page in page_numbers]
+    track_id = await rag.lightrag.ainsert(
+        input=[pages[page] for page in page_numbers],
+        ids=doc_ids,
+        file_paths=[str(source)] * len(page_numbers),
+    )
+    updates: dict[str, dict[str, object]] = {}
+    rankable_pages: set[int] = set()
+    for page, doc_id in zip(page_numbers, doc_ids):
+        status = await rag.lightrag.doc_status.get_by_id(doc_id)
+        if not status or status.get("status") != DocStatus.PROCESSED or status.get("track_id") != track_id:
+            raise RunnerInputError("page_chunk_insertion_failed")
+        chunk_ids = list(dict.fromkeys(status.get("chunks_list") or []))
+        rows = await rag.lightrag.text_chunks.get_by_ids(chunk_ids)
+        for chunk_id, row in zip(chunk_ids, rows):
+            # LightRAG deduplicates equal chunk text globally. Never claim a
+            # duplicated row owned by another page as evidence for this page.
+            if row and row.get("full_doc_id") == doc_id:
+                rankable_pages.add(page)
+                updates[chunk_id] = {**row, "page_idx": page, "page_idx_end": page}
+    if rankable_pages != set(page_numbers):
+        raise RunnerInputError("page_chunk_insertion_failed")
+    await rag.lightrag.text_chunks.upsert(updates)
+    await rag.lightrag.text_chunks.index_done_callback()
+
+
 def _atomic_replace(build_path: Path, target: Path, *, overwrite: bool) -> None:
     backup: Path | None = None
     try:
@@ -351,6 +440,7 @@ async def _build_async(
     embedding_model_path: Path,
     device: str,
     overwrite: bool,
+    page_bounded: bool = False,
 ) -> dict[str, object]:
     if not source.is_file():
         raise RunnerInputError("input_document_missing")
@@ -373,17 +463,25 @@ async def _build_async(
             device=device,
             read_only=False,
         )
-        await rag.process_document_complete(
-            file_path=str(source),
-            output_dir=str(parser_output),
-            parse_method="txt",
-            display_stats=False,
-            doc_id=document_id,
-            backend="pipeline",
-            device=device,
-            formula=False,
-            table=False,
-        )
+        if page_bounded:
+            content_list, _ = await rag.parse_document(
+                str(source), str(parser_output), "txt", False,
+                backend="pipeline", device=device, formula=False, table=False,
+            )
+            pages = _page_texts(content_list, page_count=page_count)
+            await _insert_page_bounded(rag, source=source, document_id=document_id, pages=pages)
+        else:
+            await rag.process_document_complete(
+                file_path=str(source),
+                output_dir=str(parser_output),
+                parse_method="txt",
+                display_stats=False,
+                doc_id=document_id,
+                backend="pipeline",
+                device=device,
+                formula=False,
+                table=False,
+            )
         await rag.finalize_storages()
         rag = None
         manifest = {
@@ -400,6 +498,16 @@ async def _build_async(
             "indexing_mode": "raganything-mineru-lightrag-local-v1",
             "created_at": _utc_now(),
         }
+        if page_bounded:
+            manifest["indexing_profile"] = {
+                "page_boundary_policy": "strict-page-text-v1",
+                "chunk_token_size": 512,
+                "chunk_overlap_token_size": 64,
+                "parse_method": "txt",
+                "formula": False,
+                "table": False,
+                "rankable_page_indices": sorted(pages),
+            }
         _write_json(build_path / _INDEX_MANIFEST, manifest)
         loaded_manifest = _manifest(build_path, expected_index_name=index_name)
         chunks = _text_chunks(build_path, loaded_manifest)
@@ -652,6 +760,7 @@ def _parser() -> argparse.ArgumentParser:
     index.add_argument("--embedding-model-path", required=True)
     index.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
     index.add_argument("--overwrite", action="store_true")
+    index.add_argument("--page-bounded", action="store_true", help="Index parsed text separately per physical page")
     return parser
 
 
@@ -668,6 +777,7 @@ def _index(arguments: argparse.Namespace) -> dict[str, object]:
             embedding_model_path=Path(arguments.embedding_model_path).expanduser(),
             device=_nonblank(arguments.device, "device_missing"),
             overwrite=bool(arguments.overwrite),
+            page_bounded=bool(arguments.page_bounded),
         )
     )
 

@@ -192,6 +192,53 @@ def test_manifest_hash_is_the_exact_persisted_manifest(tmp_path: Path) -> None:
     ).hexdigest()
 
 
+def test_page_bounded_text_preserves_only_explicit_physical_pages() -> None:
+    pages = eval_runner._page_texts(
+        [
+            {"type": "text", "page_idx": 0, "text": "first"},
+            {"type": "image", "page_idx": 1, "text": "not extracted text"},
+            {"type": "text", "page_idx": 2, "text": "rule"},
+            {"type": "text", "page_idx": 2, "text": "continuation"},
+        ],
+        page_count=3,
+    )
+    assert pages == {0: "first", 2: "rule\n\ncontinuation"}
+    with pytest.raises(eval_runner.RunnerInputError, match="parsed_page_provenance_invalid"):
+        eval_runner._page_texts([{"type": "text", "text": "no page"}], page_count=3)
+
+
+def test_page_bounded_manifest_checks_rankable_pages_and_single_page_chunks(tmp_path: Path) -> None:
+    index = _index(tmp_path)
+    path = index / eval_runner._INDEX_MANIFEST
+    manifest = json.loads(path.read_text())
+    manifest["indexing_profile"] = {
+        "page_boundary_policy": "strict-page-text-v1",
+        "chunk_token_size": 512,
+        "chunk_overlap_token_size": 64,
+        "parse_method": "txt",
+        "formula": False,
+        "table": False,
+        "rankable_page_indices": [1, 3],
+    }
+    path.write_text(json.dumps(manifest))
+    chunks = index / eval_runner._STORAGE / eval_runner._TEXT_CHUNKS
+    rows = json.loads(chunks.read_text())
+    rows["chunk-b"]["page_idx_end"] = 3
+    chunks.write_text(json.dumps(rows))
+    validated, _ = eval_runner._validate_index(index)
+    assert validated.indexing_profile == manifest["indexing_profile"]
+    rows["chunk-b"]["page_idx_end"] = 2
+    chunks.write_text(json.dumps(rows))
+    with pytest.raises(eval_runner.RunnerInputError, match="index_data_invalid"):
+        eval_runner._validate_index(index)
+    rows["chunk-b"]["page_idx_end"] = 3
+    chunks.write_text(json.dumps(rows))
+    manifest["indexing_profile"]["rankable_page_indices"] = [1, 2, 3]
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(eval_runner.RunnerInputError, match="index_data_invalid"):
+        eval_runner._validate_index(index)
+
+
 def test_generation_config_requires_a_real_local_reader_directory(tmp_path: Path) -> None:
     with pytest.raises(eval_runner.RunnerInputError, match="generation_model_not_local"):
         eval_runner._generation_config(
